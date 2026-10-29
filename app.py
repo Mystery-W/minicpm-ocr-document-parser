@@ -19,6 +19,7 @@ import zipfile
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any
+from pydantic import BaseModel
 
 import pymupdf as fitz
 import requests
@@ -121,7 +122,15 @@ def start_model() -> str:
 
 def work_folder(p: Path, meta: dict[str, Any]) -> Path:
     """新版和旧版使用不同目录，保留历史结果和源文件。"""
-    return p / 'layout_v2' if meta.get('mode') == 'layout_v2' else p
+    if meta.get('mode') != 'layout_v2':return p
+    if not meta.get('work_dir'):return p/'layout_v2'
+    target=Path(meta['work_dir'])
+    if not target.is_absolute() or target.name != 'layout_v2':raise RuntimeError('中间目录配置无效')
+    parent=target.parent
+    if parent.name != 'minicpm-ocr-'+meta['id'] or parent.is_symlink() or target.is_symlink():raise RuntimeError('中间目录所有权检查失败')
+    marker=parent/'.owner.json'
+    if not marker.is_file() or json.loads(marker.read_text(encoding='utf-8')).get('doc_id')!=meta['id']:raise RuntimeError('中间目录缺少所有权标记')
+    return target
 
 
 def make_final_archive(p: Path, m: dict[str, Any], output: Path) -> None:
@@ -215,12 +224,30 @@ def run_doc(doc_id: str) -> None:
         with lock: active.discard(doc_id)
 
 
-def start_layout_job(p: Path, exclude_headers: bool, segment_pages: int, ram_limit: int, segment_by_page: bool | None = None, segment_by_memory: bool | None = None) -> None:
+def start_layout_job(p: Path, exclude_headers: bool, segment_pages: int, ram_limit: int, segment_by_page: bool | None = None, segment_by_memory: bool | None = None, work_root: str | None = None) -> None:
     """首次执行切换到独立目录；续跑必须使用同一过滤选项。"""
     m = read_meta(p)
     if m.get('layout_started') and m.get('exclude_headers', True) != exclude_headers:
         raise HTTPException(409, '续跑时不能改变页眉页码选项；请重新导入创建新任务')
     # 旧任务未保存开关时沿用旧行为；新任务默认不生成临时分段。
+    if work_root and work_root.strip():
+        base=Path(work_root.strip()).expanduser()
+        if not base.is_absolute() or not base.is_dir():raise HTTPException(400,'中间文件目录必须是已存在的绝对路径')
+        base=base.resolve()
+        previous=m.get('work_root')
+        if m.get('layout_started') and (not previous or Path(previous).resolve()!=base):
+            raise HTTPException(409,'已有任务不能更改中间文件目录；请重新导入创建任务')
+        if not m.get('layout_started'):
+            owner=base/('minicpm-ocr-'+m['id'])
+            if owner.is_symlink():raise HTTPException(400,'中间目录不能是符号链接')
+            if owner.exists():
+                marker=owner/'.owner.json'
+                if not marker.is_file() or json.loads(marker.read_text(encoding='utf-8')).get('doc_id')!=m['id']:raise HTTPException(409,'目标任务目录已存在且不属于该任务')
+            else:
+                owner.mkdir()
+                atomic_text(owner/'.owner.json',json.dumps({'doc_id':m['id']}))
+            (owner/'layout_v2').mkdir(exist_ok=True)
+            m['work_root']=str(base);m['work_dir']=str(owner/'layout_v2')
     previous_default = bool(m.get('layout_started'))
     if segment_by_page is None: segment_by_page = m.get('segment_by_page', previous_default)
     if segment_by_memory is None: segment_by_memory = m.get('segment_by_memory', previous_default)
@@ -301,9 +328,10 @@ def docs() -> list[dict[str, Any]]:
         if not (p/'meta.json').exists(): continue
         try:
             m=read_meta(p); output=work_folder(p,m); m['done']=sum((output / f'page_{i:05d}.md').is_file() for i in range(1,m['pages']+1))
+            if m.get('cleanup_status') and (output/'result_complete.zip').is_file(): m['done']=m['pages']
             if m['id'] in volatile: m.update(volatile[m['id']])
             if (p/'pause.request').exists() and m['id'] not in active: m['status']='paused'
-            m['segments'] = json.loads((output/'segments.json').read_text(encoding='utf-8')) if (output/'segments.json').is_file() else []
+            m['segments'] = json.loads((output/'segments.json').read_text(encoding='utf-8')) if not m.get('cleanup_status') and (output/'segments.json').is_file() else []
             m['can_export'] = m['status'] == 'completed' and m['done'] == m['pages'] and m['id'] not in active
             if m['status'] in ('running','retrying') and m['id'] not in active: m['status']='interrupted'
             result.append(m)
@@ -312,9 +340,10 @@ def docs() -> list[dict[str, Any]]:
 
 
 @app.post('/api/docs/{doc_id}/run')
-def run(doc_id: str, exclude_headers: bool = True, segment_pages: int = 50, ram_limit: int = 90, segment_by_page: bool | None = None, segment_by_memory: bool | None = None) -> dict[str,str]:
+def run(doc_id: str, exclude_headers: bool = True, segment_pages: int = 50, ram_limit: int = 90, segment_by_page: bool | None = None, segment_by_memory: bool | None = None, work_root: str | None = None) -> dict[str,str]:
     if not 1 <= segment_pages <= 1000 or not 50 <= ram_limit <= 100: raise HTTPException(400, '分段页数或内存阈值超出范围')
     p=folder(doc_id)
+    if read_meta(p).get('cleanup_status'):raise HTTPException(409,'该任务的中间文件已清理；如需重新识别，请重新导入')
     if not model_status()['ready']: raise HTTPException(400,'模型服务未就绪')
     with lock:
         if active or batch_running: raise HTTPException(409,'已有文件正在处理，请等待完成后继续')
@@ -322,7 +351,7 @@ def run(doc_id: str, exclude_headers: bool = True, segment_pages: int = 50, ram_
         (p/'pause.request').unlink(missing_ok=True)
         active.add(doc_id)
     try:
-        start_layout_job(p, exclude_headers, segment_pages, ram_limit, segment_by_page, segment_by_memory)
+        start_layout_job(p, exclude_headers, segment_pages, ram_limit, segment_by_page, segment_by_memory, work_root)
         threading.Thread(target=run_doc,args=(doc_id,),daemon=True).start()
     except Exception:
         with lock: active.discard(doc_id)
@@ -343,7 +372,7 @@ def pause_doc(doc_id: str) -> dict[str,str]:
     return {'message':'暂停请求已发送，当前区域处理后暂停'}
 
 
-def batch_worker(ids: list[str], exclude_headers: bool, segment_pages: int, ram_limit: int, segment_by_page: bool | None, segment_by_memory: bool | None) -> None:
+def batch_worker(ids: list[str], exclude_headers: bool, segment_pages: int, ram_limit: int, segment_by_page: bool | None, segment_by_memory: bool | None, work_root: str | None) -> None:
     """同一批次串行处理，单个文件失败不阻止其余文件。"""
     global batch_running
     try:
@@ -355,7 +384,7 @@ def batch_worker(ids: list[str], exclude_headers: bool, segment_pages: int, ram_
                     with lock: active.discard(doc_id)
                     continue
                 pause_events.setdefault(doc_id,threading.Event()).clear()
-                start_layout_job(p, exclude_headers, segment_pages, ram_limit, segment_by_page, segment_by_memory)
+                start_layout_job(p, exclude_headers, segment_pages, ram_limit, segment_by_page, segment_by_memory, None if read_meta(p).get('layout_started') else work_root)
                 run_doc(doc_id)
             except Exception as exc:
                 logging.exception('批处理启动失败 %s', doc_id)
@@ -366,7 +395,7 @@ def batch_worker(ids: list[str], exclude_headers: bool, segment_pages: int, ram_
 
 
 @app.post('/api/batch')
-def batch(exclude_headers: bool = True, segment_pages: int = 50, ram_limit: int = 90, segment_by_page: bool | None = None, segment_by_memory: bool | None = None) -> dict[str, str]:
+def batch(exclude_headers: bool = True, segment_pages: int = 50, ram_limit: int = 90, segment_by_page: bool | None = None, segment_by_memory: bool | None = None, work_root: str | None = None) -> dict[str, str]:
     if not 1 <= segment_pages <= 1000 or not 50 <= ram_limit <= 100: raise HTTPException(400, '分段页数或内存阈值超出范围')
     global batch_running
     if not model_status()['ready']: raise HTTPException(400, '模型服务未就绪')
@@ -375,8 +404,28 @@ def batch(exclude_headers: bool = True, segment_pages: int = 50, ram_limit: int 
         ids = [d['id'] for d in docs() if d['done'] < d['pages'] and d['status'] != 'paused']
         if not ids: return {'message': '没有未完成文件'}
         batch_running = True
-        threading.Thread(target=batch_worker, args=(ids, exclude_headers, segment_pages, ram_limit, segment_by_page, segment_by_memory), daemon=True).start()
+        threading.Thread(target=batch_worker, args=(ids, exclude_headers, segment_pages, ram_limit, segment_by_page, segment_by_memory, work_root), daemon=True).start()
     return {'message': f'已加入 {len(ids)} 个文件，将依次处理'}
+
+
+def archive_data(output: Path, total: int) -> tuple[list[str], dict[str, bytes]]:
+    """校验原始完整包及页序；清理后用它恢复预览和再次导出。"""
+    with zipfile.ZipFile(output / 'result_complete.zip') as z:
+        if z.testzip() is not None: raise RuntimeError('原始完整 ZIP 校验失败')
+        text=z.read('document.md').decode('utf-8')
+        markers=list(re.finditer(r'(?m)^<!-- 第 (\d+) 页 -->\r?\n\r?\n',text))
+        if [int(x.group(1)) for x in markers] != list(range(1,total+1)):
+            raise RuntimeError('原始完整 ZIP 页码不完整或存在歧义')
+        pages=[]
+        for j,match in enumerate(markers):
+            value=text[match.end():markers[j+1].start() if j+1<len(markers) else len(text)]
+            if j+1<len(markers) and value.endswith('\n\n'): value=value[:-2]
+            pages.append(value)
+        assets={name:z.read(name) for name in z.namelist() if re.fullmatch(r'images/page_\d{5}_region_\d{3,5}\.png',name)}
+        for page in pages:
+            for rel in re.findall(r'!\[[^\]]*\]\((images/[^)]+)\)',page):
+                if rel not in assets: raise RuntimeError('完整 ZIP 缺少图片：'+rel)
+        return pages,assets
 
 
 @app.get('/api/docs/{doc_id}/page/{page}')
@@ -387,10 +436,14 @@ def page_data(doc_id: str, page: int, formatted: bool = True) -> dict[str, Any]:
     assets_file=output/f'page_{page:05d}.assets.json'
     assets=json.loads(assets_file.read_text(encoding='utf-8')) if text.exists() and assets_file.exists() else []
     content=text.read_text(encoding='utf-8') if text.exists() else ''
+    recovered=False
+    if m.get('cleanup_status'):
+        pages,archive_assets=archive_data(output,m['pages']);content=pages[page-1];recovered=True
+        assets=[x for x in archive_assets if x.startswith(f'images/page_{page:05d}_')]
     if content and formatted:
         from document_format import normalize_page
         content,_=normalize_page(content)
-    return {'text':content, 'done':text.exists(), 'assets':assets}
+    return {'text':content, 'done':text.exists() or recovered, 'assets':assets}
 
 
 @app.get('/api/docs/{doc_id}/image/{page}')
@@ -403,16 +456,22 @@ def asset(doc_id: str, name: str) -> FileResponse:
     p=folder(doc_id); m=read_meta(p)
     if not re.fullmatch(r'page_\d{5}_region_\d{3,5}\.png',name): raise HTTPException(404,'图片不存在')
     img=work_folder(p,m)/'images'/name
-    if not img.is_file(): raise HTTPException(404,'图片不存在')
+    if not img.is_file():
+        if m.get('cleanup_status'):
+            _,assets=archive_data(work_folder(p,m),m['pages']); data=assets.get('images/'+name)
+            if data is not None:return Response(data,media_type='image/png')
+        raise HTTPException(404,'图片不存在')
     return FileResponse(img, media_type='image/png')
 
 
-def formatted_zip(output: Path, start: int, end: int, include_page_markers: bool, merge_cross_page: bool) -> Response:
+def formatted_zip(output: Path, start: int, end: int, include_page_markers: bool, merge_cross_page: bool, output_format: str = "zip", archived: tuple[list[str], dict[str, bytes]] | None = None) -> Response:
     """从原始逐页结果派生 ZIP；确认所有页面和图片存在，不覆盖原始文件。"""
     from document_format import assemble_document
     pages=[];assets=[]
     for i in range(start,end+1):
         page=output/f'page_{i:05d}.md'; manifest=output/f'page_{i:05d}.assets.json'
+        if archived is not None:
+            pages.append(archived[0][i-1]);assets.extend(x for x in archived[1] if x.startswith(f'images/page_{i:05d}_'));continue
         if not page.is_file() or not manifest.is_file(): raise HTTPException(409,f'第 {i} 页或图片记录缺失，无法导出')
         pages.append(page.read_text(encoding='utf-8'))
         for rel in json.loads(manifest.read_text(encoding='utf-8')):
@@ -421,12 +480,22 @@ def formatted_zip(output: Path, start: int, end: int, include_page_markers: bool
             assets.append(rel)
     document,report=assemble_document(pages,include_page_markers,merge_cross_page,start_page=start)
     report.update({'page_start':start,'page_end':end,'warning':'跨页合并是启发式推断，须对照原文复核；页码为 PDF 页面序号。'})
+    if output_format in ('md','txt','pdf'):
+        from text_export import text_only_markdown, plain_text, text_pdf
+        markdown=text_only_markdown(document)
+        if output_format=='md':data=markdown.encode('utf-8');media='text/markdown; charset=utf-8'
+        elif output_format=='txt':data=plain_text(markdown).encode('utf-8');media='text/plain; charset=utf-8'
+        else:data=text_pdf(plain_text(markdown));media='application/pdf'
+        return Response(data,media_type=media,headers={'Content-Disposition':f'attachment; filename="pages_{start}-{end}.{output_format}"'})
+    if output_format!='zip':raise HTTPException(400,'不支持的导出格式')
     archive=tempfile.TemporaryFile()
     try:
         with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
             z.writestr('document.md',document)
             z.writestr('processing_report.json',json.dumps(report,ensure_ascii=False,indent=2))
-            for rel in dict.fromkeys(assets):z.write(output/rel,rel)
+            for rel in dict.fromkeys(assets):
+                if archived is None:z.write(output/rel,rel)
+                else:z.writestr(rel,archived[1][rel])
         archive.seek(0)
         def chunks():
             try:
@@ -447,13 +516,18 @@ def segment_download(doc_id: str, start: int, end: int, include_page_markers: bo
 
 
 @app.get('/api/docs/{doc_id}/export')
-def export(doc_id: str, include_page_markers: bool = True, merge_cross_page: bool = False, formatted: bool = True) -> Response:
+def export(doc_id: str, include_page_markers: bool = True, merge_cross_page: bool = False, formatted: bool = True, output_format: str = 'zip') -> Response:
     """完整文件才可导出，默认应用可复核的格式规范化。"""
     p=folder(doc_id);m=read_meta(p);output=work_folder(p,m)
     if m['status']!='completed' or doc_id in active:raise HTTPException(409,'文档尚未完整处理，不能下载')
     files=[output/f'page_{i:05d}.md' for i in range(1,m['pages']+1)]
-    if any(not f.is_file() for f in files):raise HTTPException(409,'文档缺少已完成页面，不能下载')
+    archived=None
+    if m.get('cleanup_status'):
+        try:archived=archive_data(output,m['pages'])
+        except Exception as exc:raise HTTPException(409,f'无法从原始完整 ZIP 恢复：{exc}')
+    elif any(not f.is_file() for f in files):raise HTTPException(409,'文档缺少已完成页面，不能下载')
     if m.get('mode') != 'layout_v2':
+        if output_format not in ('zip','md'):raise HTTPException(400,'旧版任务仅支持 Markdown；请重新导入后使用新版处理')
         raw_pages=[f.read_text(encoding='utf-8') for f in files]
         if formatted:
             from document_format import assemble_document
@@ -465,7 +539,74 @@ def export(doc_id: str, include_page_markers: bool = True, merge_cross_page: boo
     if not formatted:
         if not original.is_file():raise HTTPException(404,'未找到原始完整结果包')
         return FileResponse(original,media_type='application/zip',filename=f'{doc_id}_original.zip')
-    return formatted_zip(output,1,m['pages'],include_page_markers,merge_cross_page)
+    return formatted_zip(output,1,m['pages'],include_page_markers,merge_cross_page,output_format,archived)
+
+
+class SaveOptions(BaseModel):
+    """本地另存参数：输出目录由用户提供，禁止覆盖已有文件。"""
+    directory: str
+    output_format: str = 'zip'
+    include_page_markers: bool = True
+    merge_cross_page: bool = False
+    cleanup: bool = False
+
+
+@app.post('/api/docs/{doc_id}/save')
+async def save_local(doc_id: str, options: SaveOptions) -> dict[str, Any]:
+    """先保存并校验完整输出，再按用户选择清除已知中间文件。"""
+    directory=Path(options.directory.strip()).expanduser()
+    if not directory.is_absolute() or not directory.is_dir():raise HTTPException(400,'另存目录必须是已存在的绝对路径')
+    if options.output_format not in ('zip','md','txt','pdf'):raise HTTPException(400,'不支持的导出格式')
+    if options.cleanup and options.output_format!='zip':raise HTTPException(400,'清理中间文件必须先另存完整 ZIP')
+    p=folder(doc_id);m=read_meta(p);output=work_folder(p,m)
+    if m.get('mode')!='layout_v2':raise HTTPException(400,'旧版任务不支持本机另存；请重新导入后使用新版处理')
+    with lock:
+        if active or batch_running:raise HTTPException(409,'文件处理中，无法另存或清理')
+        if m['status']!='completed':raise HTTPException(409,'文档尚未完整处理')
+        active.add(doc_id)
+    try:
+        # export 使用 active 作为运行保护，另存期间持锁占位后直接调用构建函数。
+        archived=None
+        if m.get('cleanup_status'):archived=archive_data(output,m['pages'])
+        response=formatted_zip(output,1,m['pages'],options.include_page_markers,options.merge_cross_page,options.output_format,archived)
+        target=directory / (Path(m['name']).stem + '_OCR_' + uuid.uuid4().hex[:8] + '.' + options.output_format)
+        try:
+            with target.open('xb') as f:
+                if isinstance(response,StreamingResponse):
+                    async for chunk in response.body_iterator:f.write(chunk)
+                else:f.write(response.body)
+                f.flush();os.fsync(f.fileno())
+            if options.output_format=='zip':
+                with zipfile.ZipFile(target) as z:
+                    if z.testzip() is not None or 'document.md' not in z.namelist() or 'processing_report.json' not in z.namelist():raise RuntimeError('另存 ZIP 校验失败')
+                    report=json.loads(z.read('processing_report.json'))
+                    if report.get('page_start')!=1 or report.get('page_end')!=m['pages']:raise RuntimeError('另存 ZIP 页数校验失败')
+            elif target.stat().st_size==0:raise RuntimeError('导出文件为空')
+        except Exception:
+            # 不删除不完整文件，避免误删；返回路径便于检查。
+            logging.exception('另存失败，可能存在不完整文件 %s',target)
+            raise HTTPException(500,f'另存或校验失败，请检查文件：{target}')
+        cleanup_message='已保留中间文件'
+        if options.cleanup:
+            # 清理前独立检查原始完整包，确保后续预览及重新导出仍有依据。
+            try:archive_data(output,m['pages'])
+            except Exception as exc:raise HTTPException(409,f'已另存到 {target}，但原始 ZIP 校验失败，未清理：{exc}')
+            m['cleanup_status']='in_progress';write_meta(p,m)
+            removed=0;errors=[]
+            patterns=[r'page_\d{5}\.md',r'page_\d{5}\.assets\.json',r'page_\d{5}\.regions\.json',r'page_\d{5}\.regions\.tmp',r'segments\.json']
+            candidates=[x for x in output.iterdir() if x.is_file() and not x.is_symlink() and any(re.fullmatch(pattern,x.name) for pattern in patterns)]
+            for sub,pattern in [('images',r'page_\d{5}_region_\d{3,5}\.png'),('segments',r'pages_\d{5}_\d{5}\.md')]:
+                d=output/sub
+                if d.is_dir() and not d.is_symlink():candidates.extend(x for x in d.iterdir() if x.is_file() and not x.is_symlink() and re.fullmatch(pattern,x.name))
+            for item in candidates:
+                try:item.unlink();removed+=1
+                except OSError as exc:errors.append(f'{item}: {exc}')
+            m['cleanup_status']='partial' if errors else 'complete';write_meta(p,m)
+            cleanup_message=f'已清理 {removed} 个中间文件' + (f'；{len(errors)} 个未能清理，请查看日志' if errors else '')
+            for error in errors:logging.warning('清理失败 %s',error)
+        return {'path':str(target),'message':cleanup_message}
+    finally:
+        with lock:active.discard(doc_id)
 
 
 def watchdog() -> None:
