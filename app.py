@@ -380,13 +380,17 @@ def batch(exclude_headers: bool = True, segment_pages: int = 50, ram_limit: int 
 
 
 @app.get('/api/docs/{doc_id}/page/{page}')
-def page_data(doc_id: str, page: int) -> dict[str, Any]:
+def page_data(doc_id: str, page: int, formatted: bool = True) -> dict[str, Any]:
     p=folder(doc_id); m=read_meta(p)
     if not 1 <= page <= m['pages']: raise HTTPException(404,'页码超出范围')
     output=work_folder(p,m); text=output/f'page_{page:05d}.md'
     assets_file=output/f'page_{page:05d}.assets.json'
     assets=json.loads(assets_file.read_text(encoding='utf-8')) if text.exists() and assets_file.exists() else []
-    return {'text':text.read_text(encoding='utf-8') if text.exists() else '', 'done':text.exists(), 'assets':assets}
+    content=text.read_text(encoding='utf-8') if text.exists() else ''
+    if content and formatted:
+        from document_format import normalize_page
+        content,_=normalize_page(content)
+    return {'text':content, 'done':text.exists(), 'assets':assets}
 
 
 @app.get('/api/docs/{doc_id}/image/{page}')
@@ -403,76 +407,65 @@ def asset(doc_id: str, name: str) -> FileResponse:
     return FileResponse(img, media_type='image/png')
 
 
-@app.get('/api/docs/{doc_id}/segments/{start}/{end}')
-def segment_download(doc_id: str, start: int, end: int) -> Response:
-    """下载明确标识页码范围的已提交临时分段，包含关联图片。"""
-    from checkpoints import read_segments
-    p=folder(doc_id); m=read_meta(p); output=work_folder(p,m)
-    record=next((x for x in read_segments(output) if x['start']==start and x['end']==end), None)
-    if record is None: raise HTTPException(404,'临时分段不存在')
-    md=output/'segments'/record['file']
-    if not md.is_file(): raise HTTPException(409,'临时分段文件缺失')
+def formatted_zip(output: Path, start: int, end: int, include_page_markers: bool, merge_cross_page: bool) -> Response:
+    """从原始逐页结果派生 ZIP；确认所有页面和图片存在，不覆盖原始文件。"""
+    from document_format import assemble_document
+    pages=[];assets=[]
+    for i in range(start,end+1):
+        page=output/f'page_{i:05d}.md'; manifest=output/f'page_{i:05d}.assets.json'
+        if not page.is_file() or not manifest.is_file(): raise HTTPException(409,f'第 {i} 页或图片记录缺失，无法导出')
+        pages.append(page.read_text(encoding='utf-8'))
+        for rel in json.loads(manifest.read_text(encoding='utf-8')):
+            if not re.fullmatch(r'images/page_\d{5}_region_\d{3,5}\.png',rel) or not (output/rel).is_file():
+                raise HTTPException(409,f'第 {i} 页图片缺失或路径无效')
+            assets.append(rel)
+    document,report=assemble_document(pages,include_page_markers,merge_cross_page,start_page=start)
+    report.update({'page_start':start,'page_end':end,'warning':'跨页合并是启发式推断，须对照原文复核；页码为 PDF 页面序号。'})
     archive=tempfile.TemporaryFile()
     try:
         with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
-            z.write(md,'document.md')
-            for i in range(start,end+1):
-                manifest=output/f'page_{i:05d}.assets.json'
-                if not manifest.is_file(): raise HTTPException(409,'分段图片记录缺失')
-                for rel in json.loads(manifest.read_text(encoding='utf-8')):
-                    if not re.fullmatch(r'images/page_\d{5}_region_\d{3,5}\.png',rel) or not (output/rel).is_file(): raise HTTPException(409,'分段图片缺失')
-                    z.write(output/rel,rel)
+            z.writestr('document.md',document)
+            z.writestr('processing_report.json',json.dumps(report,ensure_ascii=False,indent=2))
+            for rel in dict.fromkeys(assets):z.write(output/rel,rel)
         archive.seek(0)
         def chunks():
             try:
-                while data := archive.read(1024*1024): yield data
-            finally: archive.close()
-        return StreamingResponse(chunks(),media_type='application/zip',headers={'Content-Disposition':f'attachment; filename="temporary_pages_{start}_{end}.zip"'})
+                while data := archive.read(1024*1024):yield data
+            finally:archive.close()
+        return StreamingResponse(chunks(),media_type='application/zip',headers={'Content-Disposition':f'attachment; filename="pages_{start}-{end}.zip"'})
     except Exception:
-        archive.close(); raise
+        archive.close();raise
+
+
+@app.get('/api/docs/{doc_id}/segments/{start}/{end}')
+def segment_download(doc_id: str, start: int, end: int, include_page_markers: bool = True, merge_cross_page: bool = False) -> Response:
+    """导出已提交的临时分段，格式化不改变原始结果。"""
+    from checkpoints import read_segments
+    p=folder(doc_id);m=read_meta(p);output=work_folder(p,m)
+    if not any(x['start']==start and x['end']==end for x in read_segments(output)):raise HTTPException(404,'临时分段不存在')
+    return formatted_zip(output,start,end,include_page_markers,merge_cross_page)
 
 
 @app.get('/api/docs/{doc_id}/export')
-def export(doc_id: str) -> Response:
-    """只允许所有页面成功后导出，图片与 Markdown 打包为 ZIP。"""
-    p=folder(doc_id); m=read_meta(p); output=work_folder(p,m)
-    if m['status'] != 'completed' or doc_id in active:
-        raise HTTPException(409, '文档尚未完整处理，不能下载')
+def export(doc_id: str, include_page_markers: bool = True, merge_cross_page: bool = False, formatted: bool = True) -> Response:
+    """完整文件才可导出，默认应用可复核的格式规范化。"""
+    p=folder(doc_id);m=read_meta(p);output=work_folder(p,m)
+    if m['status']!='completed' or doc_id in active:raise HTTPException(409,'文档尚未完整处理，不能下载')
     files=[output/f'page_{i:05d}.md' for i in range(1,m['pages']+1)]
-    if any(not f.is_file() for f in files):
-        raise HTTPException(409, '文档缺少已完成页面，不能下载')
-    final=output/'result_complete.zip'
-    if m.get('mode') == 'layout_v2' and final.is_file():
-        filename=quote(Path(m['name']).stem + '_解析.zip')
-        return FileResponse(final,media_type='application/zip',headers={'Content-Disposition':f"attachment; filename=ocr.zip; filename*=UTF-8''{filename}"})
-    pieces=[f'<!-- 第 {i} 页 -->\n\n'+f.read_text(encoding='utf-8') for i,f in enumerate(files,1)]
-    result='\n\n'.join(pieces)
+    if any(not f.is_file() for f in files):raise HTTPException(409,'文档缺少已完成页面，不能下载')
     if m.get('mode') != 'layout_v2':
-        return Response(result,media_type='text/markdown; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{doc_id}.md"'})
-    archive=tempfile.TemporaryFile()
-    try:
-      with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
-        z.writestr('document.md',result)
-        for i in range(1,m['pages']+1):
-            manifest=output/f'page_{i:05d}.assets.json'
-            if not manifest.is_file():
-                raise HTTPException(409,f'第 {i} 页缺少图片记录，不能下载')
-            for rel in json.loads(manifest.read_text(encoding='utf-8')):
-                if not re.fullmatch(r'images/page_\d{5}_region_\d{3,5}\.png',rel):
-                    raise HTTPException(409,'图片记录无效，不能下载')
-                image=output/rel
-                if not image.is_file():
-                    raise HTTPException(409,f'图片缺失：{rel}')
-                z.write(image,rel)
-    except Exception:
-        archive.close(); raise
-    archive.seek(0)
-    def chunks():
-        try:
-            while data := archive.read(1024*1024): yield data
-        finally: archive.close()
-    filename=quote(Path(m['name']).stem + '_解析.zip')
-    return StreamingResponse(chunks(), media_type='application/zip', headers={'Content-Disposition':f"attachment; filename=ocr.zip; filename*=UTF-8''{filename}"})
+        raw_pages=[f.read_text(encoding='utf-8') for f in files]
+        if formatted:
+            from document_format import assemble_document
+            text,_=assemble_document(raw_pages,include_page_markers,merge_cross_page)
+        else:
+            text='\n\n'.join(f'<!-- 第 {i} 页 -->\n\n'+content for i,content in enumerate(raw_pages,1))
+        return Response(text,media_type='text/markdown; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{doc_id}.md"'})
+    original=output/'result_complete.zip'
+    if not formatted:
+        if not original.is_file():raise HTTPException(404,'未找到原始完整结果包')
+        return FileResponse(original,media_type='application/zip',filename=f'{doc_id}_original.zip')
+    return formatted_zip(output,1,m['pages'],include_page_markers,merge_cross_page)
 
 
 def watchdog() -> None:

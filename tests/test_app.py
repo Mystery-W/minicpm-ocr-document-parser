@@ -32,6 +32,23 @@ class Tests(unittest.TestCase):
         with zipfile.ZipFile(out/'result_complete.zip') as z:self.assertEqual(z.read('document.md').decode().count('<!-- 第 '),2)
         self.assertEqual(client.get(f'/api/docs/{doc}/export').status_code,200)
         (out/'page_00002.md').unlink();self.assertEqual(client.get(f'/api/docs/{doc}/export').status_code,409)
+    def test_export_options_and_raw_preservation(self):
+        doc=uuid.uuid4().hex;p=self.root/doc;p.mkdir();out=p/'layout_v2';out.mkdir()
+        app.write_meta(p,{'id':doc,'name':'test.pdf','stored':'source.pdf','pages':2,'status':'completed','mode':'layout_v2'})
+        pages=['A paragraph that continues across the page by', 'continuing with lowercase text on the following page.']
+        for n,text in enumerate(pages,1):
+            (out/f'page_{n:05d}.md').write_text(text,encoding='utf-8');(out/f'page_{n:05d}.assets.json').write_text('[]',encoding='utf-8')
+        client=TestClient(app.app)
+        for marker in (True,False):
+            for merge in (True,False):
+                response=client.get(f'/api/docs/{doc}/export',params={'include_page_markers':marker,'merge_cross_page':merge})
+                self.assertEqual(response.status_code,200)
+                with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                    text=z.read('document.md').decode();report=json.loads(z.read('processing_report.json'))
+                    self.assertEqual('【PDF 第 2 页】' in text,marker)
+                    self.assertEqual(bool(report['merged_boundaries']),merge)
+        self.assertEqual([(out/f'page_{n:05d}.md').read_text(encoding='utf-8') for n in (1,2)],pages)
+
     def test_environment_api(self):
         response=TestClient(app.app).get('/api/environment');self.assertEqual(response.status_code,200);self.assertIn('python',response.json());self.assertIn('gpu',response.json())
 
