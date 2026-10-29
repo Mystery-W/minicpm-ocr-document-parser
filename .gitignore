@@ -1,0 +1,15 @@
+# Exclude runtime files and user documents from source publication.
+.venv/
+__pycache__/
+*.py[cod]
+data/
+models/
+runtime/
+runtime_new/
+downloads/
+backups/
+*.log
+*.tmp
+*.part
+work*/
+.env
